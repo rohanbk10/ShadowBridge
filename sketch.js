@@ -19,6 +19,7 @@ const BALL_RESTITUTION   = 0.6;
 // ── SECTION 2: Globals ───────────────────────────────────────────
 let GAME_STATE = 'CALIBRATING';   // 'CALIBRATING' | 'PLAYING' | 'WIN'
 let debugMode  = false;
+let cameraViewMode = false;
 
 // Vision (populated by Part 2; stubs live in Section 7)
 let homographyTransform = null;
@@ -337,18 +338,18 @@ function draw() {
 
   // ── 3. Game logic (PLAYING only) ──────────────────────────────
   if (GAME_STATE === 'PLAYING') {
-    updateShadowColliders();
+    if (frameCount % shadowRebuildRate === 0) updateShadowColliders();
     checkWin();
     checkRespawn();
   }
 
   // ── 4. Render ─────────────────────────────────────────────────
-  background(0);
+  background(255);
 
-  // Ghost webcam (unmirrored — mobile camera stream is not flipped)
-  if (video) {
+  // Optional webcam overlay (toggle with C — unmirrored mobile camera feed)
+  if (cameraViewMode && video) {
     push();
-    tint(255, 30);
+    tint(255, 80);
     image(video, 0, 0, width, height);
     pop();
   }
@@ -362,7 +363,7 @@ function draw() {
 
     push();
     noStroke();
-    fill(0, 255, 80, 200);
+    fill(0, 160, 60, 220);
     Object.values(detectedMarkers).forEach(({ camX, camY }) => {
       const [sx, sy] = camToCanvas(camX, camY);
       circle(sx, sy, 16);
@@ -389,12 +390,12 @@ function draw() {
   // Bucket glow
   push();
   noStroke();
-  fill(255, 220, 50, 18);
+  fill(255, 200, 0, 40);
   rect(BUCKET_PADDING, height - BUCKET_PADDING - BUCKET_HEIGHT,
        BUCKET_WIDTH, BUCKET_HEIGHT);
 
   // Bucket walls (visual only — physics bodies drawn separately)
-  stroke(255, 220, 50, 160);
+  stroke(200, 140, 0, 200);
   strokeWeight(2);
   noFill();
   // left wall
@@ -419,15 +420,15 @@ function draw() {
     const by = ball.position.y;
 
     // Glow
-    drawingContext.shadowColor = 'rgba(255,255,255,0.8)';
-    drawingContext.shadowBlur  = 24;
-    fill(255);
+    drawingContext.shadowColor = 'rgba(0,0,0,0.25)';
+    drawingContext.shadowBlur  = 16;
+    fill(30, 30, 40);
     noStroke();
     circle(bx, by, BALL_RADIUS * 2);
 
     // Velocity direction dot
     drawingContext.shadowBlur = 0;
-    fill(0, 200, 255);
+    fill(0, 120, 220);
     const vel = ball.velocity;
     const speed = sqrt(vel.x * vel.x + vel.y * vel.y);
     if (speed > 0.5) {
@@ -438,11 +439,11 @@ function draw() {
 
   // HUD
   push();
-  fill(255, 200);
+  fill(40, 40, 40, 200);
   noStroke();
   textSize(12);
   textFont('monospace');
-  text(`FPS: ${nf(frameRate(), 2, 1)}  shadowRate: ${shadowRebuildRate}  [D] debug`, 10, height - 10);
+  text(`FPS: ${nf(frameRate(), 2, 1)}  shadowRate: ${shadowRebuildRate}  [C] camera  [D] debug`, 10, height - 10);
   pop();
 
   // ── 5. Adaptive shadow rebuild rate ───────────────────────────
@@ -463,7 +464,6 @@ function windowResized() {
 }
 
 function keyPressed() {
-  if (key === 'D' || key === 'd') {
-    debugMode = !debugMode;
-  }
+  if (key === 'D' || key === 'd') debugMode = !debugMode;
+  if (key === 'C' || key === 'c') cameraViewMode = !cameraViewMode;
 }

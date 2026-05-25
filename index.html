@@ -5,26 +5,38 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>ShadowBridge</title>
   <style>
-    html, body { margin: 0; overflow: hidden; background: #000; }
-    #defaultCanvas0 { position: fixed; top: 0; left: 0; }
+    html, body { margin: 0; overflow: hidden; background: #fff; }
+    #defaultCanvas0 { position: fixed; top: 0; left: 0; z-index: 1; }
 
-    #qr-overlay { position: fixed; inset: 0; pointer-events: none; }
-    #qr-tl { position: absolute; top:  20px; left:  20px; background: #000; }
-    #qr-tr { position: absolute; top:  20px; right: 20px; background: #000; }
-    #qr-bl { position: absolute; bottom: 20px; left:  20px; background: #000; }
-    #qr-br { position: absolute; bottom: 20px; right: 20px; background: #000; }
+    #qr-overlay { position: fixed; inset: 0; pointer-events: none; z-index: 10; }
+    #qr-tl, #qr-tr, #qr-bl, #qr-br {
+      position: absolute;
+      width: 80px;
+      height: 80px;
+      background: #fff;
+      border: 2px solid #cc0000;
+      box-sizing: border-box;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    #qr-tl { top: 20px; left: 20px; }
+    #qr-tr { top: 20px; right: 20px; }
+    #qr-bl { bottom: 20px; left: 20px; }
+    #qr-br { bottom: 20px; right: 20px; }
     .dimmed { opacity: 0.35; transition: opacity 0.3s; }
 
     #ui-overlay {
       position: fixed; inset: 0;
       pointer-events: none;
+      z-index: 20;
     }
     #calibration-status {
       position: absolute; top: 16px; left: 50%;
       transform: translateX(-50%);
-      color: #fff; font: 600 15px/1.4 monospace;
-      background: rgba(0,0,0,0.55); padding: 6px 14px;
-      border-radius: 6px; pointer-events: none;
+      color: #111; font: 600 15px/1.4 monospace;
+      background: rgba(255,255,255,0.9); padding: 6px 14px;
+      border: 1px solid #ccc; border-radius: 6px; pointer-events: none;
     }
     #btn-recalibrate {
       position: absolute; top: 16px; right: 20px;
@@ -68,8 +80,8 @@
       const ids   = ['qr-tl', 'qr-tr', 'qr-bl', 'qr-br'];
       const texts = ['SHADOW_TL', 'SHADOW_TR', 'SHADOW_BL', 'SHADOW_BR'];
       ids.forEach((id, i) => {
-        new QRCode(id, { text: texts[i], width: 80, height: 80,
-          colorDark: '#000000', colorLight: '#ffffff' });
+        new QRCode(id, { text: texts[i], width: 76, height: 76,
+          colorDark: '#cc0000', colorLight: '#ffffff' });
       });
     });
   </script>

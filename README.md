@@ -59,4 +59,6 @@ Edit the constants block at the top of `sketch.js`:
 
 ## Debug
 
-Press **`D`** in-game to toggle the shadow collider overlay (red rectangles).
+Press **`C`** to toggle the webcam overlay on the canvas (off by default).
+
+Press **`D`** to toggle the shadow collider overlay (red rectangles).
