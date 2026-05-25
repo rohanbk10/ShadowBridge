@@ -1,7 +1,18 @@
 // ── SECTION 1: Constants ──────────────────────────────────────────
 const GRAVITY            = 1.0;
+
+// Camera capture resolution — higher res makes QR codes larger in the frame
+// so jsQR can decode them reliably even when the camera is far from the wall.
+const CAL_WIDTH          = 640;
+const CAL_HEIGHT         = 480;
+
+// Shadow detection processes cells at a coarser logical grid.
+// PROCESS_STRIDE is how many CAL pixels equal one logical shadow pixel.
+// Keeping this as a power-of-two integer makes the stride arithmetic exact.
 const PROCESS_WIDTH      = 320;
 const PROCESS_HEIGHT     = 240;
+const PROCESS_STRIDE     = CAL_WIDTH / PROCESS_WIDTH;   // = 2
+
 const SHADOW_THRESHOLD   = 50;
 const SHADOW_CELL_SIZE   = 8;
 const SHADOW_MIN_SEGMENT = 3;
@@ -44,11 +55,16 @@ let lastRespawnFrame  = 0;
 function setup() {
   createCanvas(windowWidth, windowHeight);
 
-  // Video capture — constrained to processing resolution, hidden from DOM
-  video = createCapture(VIDEO, () => {
-    video.size(PROCESS_WIDTH, PROCESS_HEIGHT);
-    video.hide();
-  });
+  // Request calibration resolution explicitly so jsQR sees large, crisp QR
+  // codes. Shadow detection samples this same frame at a 2× stride, so no
+  // separate low-res stream or mid-game resize is needed.
+  video = createCapture(
+    { video: { width: { ideal: CAL_WIDTH }, height: { ideal: CAL_HEIGHT } } },
+    () => {
+      video.size(CAL_WIDTH, CAL_HEIGHT);
+      video.hide();
+    }
+  );
 
   // Matter engine — no Render, no Runner
   engine = Matter.Engine.create();
@@ -245,7 +261,8 @@ function scanQuadrant(px, rx, ry, rw, rh) {
   const data = new Uint8ClampedArray(rw * rh * 4);
   for (let row = 0; row < rh; row++) {
     for (let col = 0; col < rw; col++) {
-      const si = ((ry + row) * PROCESS_WIDTH + (rx + col)) * 4;
+      // Stride must match the full CAL frame width, not the shadow-processing width.
+      const si = ((ry + row) * CAL_WIDTH + (rx + col)) * 4;
       const di = (row * rw + col) * 4;
       data[di]     = px[si];
       data[di + 1] = px[si + 1];
@@ -279,6 +296,10 @@ function updateShadowColliders() {
   // Build shadow grid: true = cell is meaningfully darker than the reference frame.
   // Background subtraction lets us ignore projected game graphics (ball, bucket lines)
   // that would otherwise look like shadow under a pure brightness threshold.
+  //
+  // Pixels are sampled from the full 640×480 CAL frame using PROCESS_STRIDE,
+  // giving the same logical cell density as a 320×240 frame but from a
+  // higher-quality capture — no second video stream or mid-game resize needed.
   const grid = new Uint8Array(cols * rows);
   for (let row = 0; row < rows; row++) {
     for (let col = 0; col < cols; col++) {
@@ -286,9 +307,10 @@ function updateShadowColliders() {
       const totalPixels = SHADOW_CELL_SIZE * SHADOW_CELL_SIZE;
       for (let dy = 0; dy < SHADOW_CELL_SIZE; dy++) {
         for (let dx = 0; dx < SHADOW_CELL_SIZE; dx++) {
-          const cx = col * SHADOW_CELL_SIZE + dx;
-          const cy = row * SHADOW_CELL_SIZE + dy;
-          const i  = (cy * PROCESS_WIDTH + cx) * 4;
+          // Multiply by PROCESS_STRIDE to convert logical coords → CAL pixels
+          const cx = (col * SHADOW_CELL_SIZE + dx) * PROCESS_STRIDE;
+          const cy = (row * SHADOW_CELL_SIZE + dy) * PROCESS_STRIDE;
+          const i  = (cy * CAL_WIDTH + cx) * 4;
           const brightness    = (px[i] + px[i + 1] + px[i + 2]) / 3;
           const refBrightness = ref
             ? (ref[i] + ref[i + 1] + ref[i + 2]) / 3
@@ -327,8 +349,11 @@ function updateShadowColliders() {
   shadowBodies = [];
 
   toAdd.forEach(({ row, runStart, runLen }) => {
-    const camCX = (runStart + runLen / 2) * SHADOW_CELL_SIZE;
-    const camCY = (row + 0.5) * SHADOW_CELL_SIZE;
+    // All cam-space coordinates are in CAL pixels (multiply logical cell coords
+    // by PROCESS_STRIDE) so they align with the homography, which was built
+    // from QR-code positions detected in the 640×480 frame.
+    const camCX = (runStart + runLen / 2) * SHADOW_CELL_SIZE * PROCESS_STRIDE;
+    const camCY = (row + 0.5)             * SHADOW_CELL_SIZE * PROCESS_STRIDE;
     const [cx, cy] = camToCanvas(camCX, camCY);
 
     // Discard segments that project outside the walled play area. Without this,
@@ -339,15 +364,15 @@ function updateShadowColliders() {
 
     // Derive actual canvas-space width by transforming both horizontal edges
     // of the segment through the homography rather than using a linear scale.
-    const camLeft  = runStart * SHADOW_CELL_SIZE;
-    const camRight = (runStart + runLen) * SHADOW_CELL_SIZE;
+    const camLeft  = runStart             * SHADOW_CELL_SIZE * PROCESS_STRIDE;
+    const camRight = (runStart + runLen)  * SHADOW_CELL_SIZE * PROCESS_STRIDE;
     const [lx]     = camToCanvas(camLeft,  camCY);
     const [rx]     = camToCanvas(camRight, camCY);
     const bodyW    = Math.abs(rx - lx);
 
     // Derive height by transforming the top and bottom edges of the cell row.
-    const camTop    = row * SHADOW_CELL_SIZE;
-    const camBottom = (row + 1) * SHADOW_CELL_SIZE;
+    const camTop    = row       * SHADOW_CELL_SIZE * PROCESS_STRIDE;
+    const camBottom = (row + 1) * SHADOW_CELL_SIZE * PROCESS_STRIDE;
     const [, ty]    = camToCanvas(camCX, camTop);
     const [, by2]   = camToCanvas(camCX, camBottom);
     const bodyH     = Math.abs(by2 - ty);
@@ -375,15 +400,17 @@ function draw() {
   if (GAME_STATE === 'CALIBRATING') {
     video.loadPixels();
     if (video.pixels && video.pixels.length > 0) {
-      const OV = 20; // overlap margin in camera pixels
-      const HW = PROCESS_WIDTH  / 2 + OV;
-      const HH = PROCESS_HEIGHT / 2 + OV;
+      // Overlap margin scaled to CAL resolution so each half-frame has the
+      // same proportional overlap as before (≈12.5 % of each half-width).
+      const OV = 20 * PROCESS_STRIDE;
+      const HW = CAL_WIDTH  / 2 + OV;
+      const HH = CAL_HEIGHT / 2 + OV;
 
       const quadrants = [
-        { rx: 0,                   ry: 0,                    rw: HW, rh: HH },  // TL
-        { rx: PROCESS_WIDTH/2-OV,  ry: 0,                    rw: HW, rh: HH },  // TR
-        { rx: 0,                   ry: PROCESS_HEIGHT/2-OV,  rw: HW, rh: HH },  // BL
-        { rx: PROCESS_WIDTH/2-OV,  ry: PROCESS_HEIGHT/2-OV,  rw: HW, rh: HH }, // BR
+        { rx: 0,                ry: 0,               rw: HW, rh: HH },  // TL
+        { rx: CAL_WIDTH/2-OV,  ry: 0,               rw: HW, rh: HH },  // TR
+        { rx: 0,               ry: CAL_HEIGHT/2-OV, rw: HW, rh: HH },  // BL
+        { rx: CAL_WIDTH/2-OV,  ry: CAL_HEIGHT/2-OV, rw: HW, rh: HH }, // BR
       ];
 
       quadrants.forEach(q => {
