@@ -9,7 +9,7 @@ projected wall, guide a bouncing ball into the bucket.
 2. A webcam (mobile phone recommended) faces the projected area.
 3. The four corner QR codes calibrate the perspective transform.
 4. Stand between the projector and the wall — your shadow becomes a ramp.
-5. Guide the ball into the glowing bucket in the bottom-left corner to win.
+5. Guide the ball into the glowing bucket in the bottom-right corner to win.
 
 ## Run locally
 

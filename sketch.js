@@ -10,7 +10,6 @@ const WALL_FRICTION      = 0.3;
 const WALL_RESTITUTION   = 0.4;
 const BUCKET_WIDTH       = 160;
 const BUCKET_HEIGHT      = 120;
-const BUCKET_PADDING     = 20;
 const QR_SIZE            = 80;
 const QR_PADDING         = 20;
 const QR_SAFE_MARGIN     = QR_PADDING + QR_SIZE + 16;
@@ -23,20 +22,21 @@ let GAME_STATE = 'CALIBRATING';   // 'CALIBRATING' | 'PLAYING' | 'WIN'
 let debugMode  = false;
 let cameraViewMode = false;
 
-// Vision (populated by Part 2; stubs live in Section 7)
+// Vision
 let homographyTransform = null;
 let detectedMarkers     = {};     // { 'SHADOW_TL': {camX,camY}, ... }
 let video               = null;
-let shadowMask          = null;   // Uint8Array, allocated in Part 2
+let referencePixels     = null;   // Uint8Array snapshot of the projected wall with no shadow present;
+                                  // captured at the CALIBRATING→PLAYING transition for background subtraction
 
 // Matter
 let engine;
 let ball;
 let boundaryBodies = [];
 let bucketBodies   = [];
-let shadowBodies   = [];          // managed by Part 2
+let shadowBodies   = [];
 
-// Adaptive shadow rebuild rate (Part 2 reads/writes this)
+// Adaptive shadow rebuild rate
 let shadowRebuildRate = 6;
 let lastRespawnFrame  = 0;
 
@@ -103,7 +103,7 @@ function rebuildStaticBodies() {
 
   const opts = { isStatic: true, friction: WALL_FRICTION, restitution: WALL_RESTITUTION };
 
-  // Side walls inset so they do not run through corner QR zones
+  // Side walls + ceiling inset so they do not run through corner QR zones
   const wallTop    = QR_SAFE_MARGIN;
   const wallHeight = max(height - QR_SAFE_MARGIN * 2, 100);
   const wallCenterY = wallTop + wallHeight / 2;
@@ -112,7 +112,11 @@ function rebuildStaticBodies() {
     WALL_THICKNESS / 2, wallCenterY, WALL_THICKNESS, wallHeight, opts);
   const rightWall = Matter.Bodies.rectangle(
     width - WALL_THICKNESS / 2, wallCenterY, WALL_THICKNESS, wallHeight, opts);
-  boundaryBodies.push(leftWall, rightWall);
+  const ceilingWidth = max(width - QR_SAFE_MARGIN * 2, 100);
+  const ceiling = Matter.Bodies.rectangle(
+    width / 2, QR_SAFE_MARGIN - WALL_THICKNESS / 2,
+    ceilingWidth, WALL_THICKNESS, opts);
+  boundaryBodies.push(leftWall, rightWall, ceiling);
 
   // Bucket — bottom-right, clear of BR QR corner
   const { bx, by } = getBucketOrigin();
@@ -151,7 +155,9 @@ function spawnBall() {
 }
 
 function checkRespawn() {
-  if (!ball || ball.position.y <= height + 100) return;
+  if (!ball) return;
+  const outOfBounds = ball.position.y > height + 100 || ball.position.y < -100;
+  if (!outOfBounds) return;
   if (frameCount - lastRespawnFrame < RESPAWN_COOLDOWN) return;
   spawnBall();
 }
@@ -179,13 +185,13 @@ function updateUIForState() {
   statusEl.style.display = GAME_STATE === 'CALIBRATING' ? 'block' : 'none';
   recalBtn.hidden         = GAME_STATE !== 'PLAYING';
   winEl.hidden            = GAME_STATE !== 'WIN';
-  winEl.style.display     = GAME_STATE === 'WIN' ? 'flex' : 'none';
   qrOverlay.classList.toggle('dimmed', GAME_STATE !== 'CALIBRATING');
 }
 
 function startRecalibration() {
   detectedMarkers     = {};
   homographyTransform = null;
+  referencePixels     = null;   // stale snapshot — will be re-captured at next transition
   shadowBodies.forEach(b => Matter.Composite.remove(engine.world, b));
   shadowBodies = [];
   if (ball) {
@@ -266,10 +272,13 @@ function updateShadowColliders() {
   if (!video.pixels || video.pixels.length === 0) return;
 
   const px   = video.pixels;
+  const ref  = referencePixels; // may be null before first calibration
   const cols = Math.floor(PROCESS_WIDTH  / SHADOW_CELL_SIZE);
   const rows = Math.floor(PROCESS_HEIGHT / SHADOW_CELL_SIZE);
 
-  // Build shadow grid: true = cell is in shadow
+  // Build shadow grid: true = cell is meaningfully darker than the reference frame.
+  // Background subtraction lets us ignore projected game graphics (ball, bucket lines)
+  // that would otherwise look like shadow under a pure brightness threshold.
   const grid = new Uint8Array(cols * rows);
   for (let row = 0; row < rows; row++) {
     for (let col = 0; col < cols; col++) {
@@ -280,8 +289,11 @@ function updateShadowColliders() {
           const cx = col * SHADOW_CELL_SIZE + dx;
           const cy = row * SHADOW_CELL_SIZE + dy;
           const i  = (cy * PROCESS_WIDTH + cx) * 4;
-          const brightness = (px[i] + px[i + 1] + px[i + 2]) / 3;
-          if (brightness < SHADOW_THRESHOLD) darkCount++;
+          const brightness    = (px[i] + px[i + 1] + px[i + 2]) / 3;
+          const refBrightness = ref
+            ? (ref[i] + ref[i + 1] + ref[i + 2]) / 3
+            : 255; // treat full white as reference when no snapshot exists
+          if (brightness < refBrightness - SHADOW_THRESHOLD) darkCount++;
         }
       }
       if (darkCount > totalPixels * 0.5) grid[row * cols + col] = 1;
@@ -314,18 +326,33 @@ function updateShadowColliders() {
   shadowBodies.forEach(b => Matter.Composite.remove(engine.world, b));
   shadowBodies = [];
 
-  const scaleX = width  / PROCESS_WIDTH;
-  const scaleY = height / PROCESS_HEIGHT;
-
   toAdd.forEach(({ row, runStart, runLen }) => {
     const camCX = (runStart + runLen / 2) * SHADOW_CELL_SIZE;
     const camCY = (row + 0.5) * SHADOW_CELL_SIZE;
     const [cx, cy] = camToCanvas(camCX, camCY);
 
-    const bodyW = runLen * SHADOW_CELL_SIZE * scaleX;
-    const bodyH = SHADOW_CELL_SIZE * scaleY;
+    // Discard segments that project outside the walled play area. Without this,
+    // shadow bodies can appear behind the side walls or above the ceiling wall,
+    // creating invisible obstacles outside the playfield.
+    if (cx < WALL_THICKNESS || cx > width - WALL_THICKNESS) return;
+    if (cy < QR_SAFE_MARGIN || cy > height) return;
 
-    const b = Matter.Bodies.rectangle(cx, cy, bodyW, bodyH, {
+    // Derive actual canvas-space width by transforming both horizontal edges
+    // of the segment through the homography rather than using a linear scale.
+    const camLeft  = runStart * SHADOW_CELL_SIZE;
+    const camRight = (runStart + runLen) * SHADOW_CELL_SIZE;
+    const [lx]     = camToCanvas(camLeft,  camCY);
+    const [rx]     = camToCanvas(camRight, camCY);
+    const bodyW    = Math.abs(rx - lx);
+
+    // Derive height by transforming the top and bottom edges of the cell row.
+    const camTop    = row * SHADOW_CELL_SIZE;
+    const camBottom = (row + 1) * SHADOW_CELL_SIZE;
+    const [, ty]    = camToCanvas(camCX, camTop);
+    const [, by2]   = camToCanvas(camCX, camBottom);
+    const bodyH     = Math.abs(by2 - ty);
+
+    const b = Matter.Bodies.rectangle(cx, cy, Math.max(bodyW, 2), Math.max(bodyH, 2), {
       isStatic:    true,
       label:       'shadow',
       friction:    WALL_FRICTION,
@@ -368,6 +395,12 @@ function draw() {
 
       // Transition when all four found
       if (Object.keys(detectedMarkers).length === 4) {
+        // Snapshot the current camera frame as the background reference.
+        // At this moment no user shadow is present (user was holding the camera
+        // to frame the QR codes), so this cleanly represents the projected wall
+        // without any occlusion.
+        referencePixels = new Uint8Array(video.pixels);
+
         homographyTransform = PerspT(buildSrcPts(detectedMarkers), buildDstPts());
         GAME_STATE = 'PLAYING';
         spawnBall();
@@ -448,15 +481,15 @@ function draw() {
   // Ball
   if (ball) {
     push();
-    const bx = ball.position.x;
-    const by = ball.position.y;
+    const ballX = ball.position.x;
+    const ballY = ball.position.y;
 
     // Glow
     drawingContext.shadowColor = 'rgba(0,0,0,0.25)';
     drawingContext.shadowBlur  = 16;
     fill(30, 30, 40);
     noStroke();
-    circle(bx, by, BALL_RADIUS * 2);
+    circle(ballX, ballY, BALL_RADIUS * 2);
 
     // Velocity direction dot
     drawingContext.shadowBlur = 0;
@@ -464,7 +497,7 @@ function draw() {
     const vel = ball.velocity;
     const speed = sqrt(vel.x * vel.x + vel.y * vel.y);
     if (speed > 0.5) {
-      circle(bx + vel.x * 2, by + vel.y * 2, 5);
+      circle(ballX + vel.x * 2, ballY + vel.y * 2, 5);
     }
     pop();
   }
