@@ -39,17 +39,19 @@
       border: 1px solid #ccc; border-radius: 6px; pointer-events: none;
     }
     #btn-recalibrate {
-      position: absolute; top: 16px; right: 20px;
+      position: absolute; top: 116px; left: 20px;
       pointer-events: auto;
     }
     #win-overlay {
       position: absolute; inset: 0;
-      display: flex; flex-direction: column;
+      flex-direction: column;
       align-items: center; justify-content: center;
       pointer-events: auto;
       background: rgba(0,0,0,0.6);
       color: #fff;
     }
+    #win-overlay:not([hidden]) { display: flex; }
+    #win-overlay[hidden] { display: none !important; }
     #win-overlay h1 { font: 700 48px/1 sans-serif; margin-bottom: 24px; }
     #btn-play-again { font-size: 18px; padding: 10px 28px; cursor: pointer; }
   </style>

@@ -13,8 +13,10 @@ const BUCKET_HEIGHT      = 120;
 const BUCKET_PADDING     = 20;
 const QR_SIZE            = 80;
 const QR_PADDING         = 20;
+const QR_SAFE_MARGIN     = QR_PADDING + QR_SIZE + 16;
 const BALL_RADIUS        = 18;
 const BALL_RESTITUTION   = 0.6;
+const RESPAWN_COOLDOWN   = 45;
 
 // ── SECTION 2: Globals ───────────────────────────────────────────
 let GAME_STATE = 'CALIBRATING';   // 'CALIBRATING' | 'PLAYING' | 'WIN'
@@ -36,6 +38,7 @@ let shadowBodies   = [];          // managed by Part 2
 
 // Adaptive shadow rebuild rate (Part 2 reads/writes this)
 let shadowRebuildRate = 6;
+let lastRespawnFrame  = 0;
 
 // ── SECTION 3: p5 setup() ────────────────────────────────────────
 function setup() {
@@ -67,7 +70,31 @@ function setup() {
   noStroke();
 }
 
-// ── SECTION 4: Matter bodies ─────────────────────────────────────
+// ── SECTION 4: Layout + Matter bodies ────────────────────────────
+function getBucketOrigin() {
+  return {
+    bx: width - QR_SAFE_MARGIN - BUCKET_WIDTH,
+    by: height - QR_SAFE_MARGIN,
+  };
+}
+
+function getBucketWinBounds() {
+  const { bx, by } = getBucketOrigin();
+  return {
+    bucketLeft:   bx + WALL_THICKNESS,
+    bucketRight:  bx + BUCKET_WIDTH - WALL_THICKNESS,
+    bucketTop:    by - BUCKET_HEIGHT,
+    bucketBottom: by - WALL_THICKNESS,
+  };
+}
+
+function getBallSpawnPoint() {
+  return {
+    x: QR_SAFE_MARGIN + BALL_RADIUS + 12,
+    y: QR_SAFE_MARGIN + 36,
+  };
+}
+
 function rebuildStaticBodies() {
   boundaryBodies.forEach(b => Matter.Composite.remove(engine.world, b));
   bucketBodies.forEach(b   => Matter.Composite.remove(engine.world, b));
@@ -76,17 +103,19 @@ function rebuildStaticBodies() {
 
   const opts = { isStatic: true, friction: WALL_FRICTION, restitution: WALL_RESTITUTION };
 
-  // Left wall
+  // Side walls inset so they do not run through corner QR zones
+  const wallTop    = QR_SAFE_MARGIN;
+  const wallHeight = max(height - QR_SAFE_MARGIN * 2, 100);
+  const wallCenterY = wallTop + wallHeight / 2;
+
   const leftWall  = Matter.Bodies.rectangle(
-    WALL_THICKNESS / 2, height / 2, WALL_THICKNESS, height, opts);
-  // Right wall
+    WALL_THICKNESS / 2, wallCenterY, WALL_THICKNESS, wallHeight, opts);
   const rightWall = Matter.Bodies.rectangle(
-    width - WALL_THICKNESS / 2, height / 2, WALL_THICKNESS, height, opts);
+    width - WALL_THICKNESS / 2, wallCenterY, WALL_THICKNESS, wallHeight, opts);
   boundaryBodies.push(leftWall, rightWall);
 
-  // Bucket — bottom-left, U-shape (3 bodies)
-  const bx = BUCKET_PADDING;                    // bucket left edge (outer)
-  const by = height - BUCKET_PADDING;           // bucket bottom edge (outer)
+  // Bucket — bottom-right, clear of BR QR corner
+  const { bx, by } = getBucketOrigin();
 
   const bucketBottom = Matter.Bodies.rectangle(
     bx + BUCKET_WIDTH / 2,
@@ -109,25 +138,27 @@ function rebuildStaticBodies() {
 // ── SECTION 5: Ball lifecycle ────────────────────────────────────
 function spawnBall() {
   if (ball) Matter.Composite.remove(engine.world, ball);
-  ball = Matter.Bodies.circle(width * 0.85, 80, BALL_RADIUS, {
+  const { x, y } = getBallSpawnPoint();
+  ball = Matter.Bodies.circle(x, y, BALL_RADIUS, {
     restitution: BALL_RESTITUTION,
     friction: 0.01,
     label: 'ball'
   });
-  Matter.Body.setVelocity(ball, { x: -3, y: 2 });
+  Matter.Body.setStatic(ball, false);
+  Matter.Body.setVelocity(ball, { x: 4, y: 1 });
   Matter.Composite.add(engine.world, ball);
+  lastRespawnFrame = frameCount;
 }
 
 function checkRespawn() {
-  if (ball && ball.position.y > height + 100) spawnBall();
+  if (!ball || ball.position.y <= height + 100) return;
+  if (frameCount - lastRespawnFrame < RESPAWN_COOLDOWN) return;
+  spawnBall();
 }
 
 function checkWin() {
-  if (!ball) return;
-  const bucketLeft   = BUCKET_PADDING + WALL_THICKNESS;
-  const bucketRight  = BUCKET_PADDING + BUCKET_WIDTH - WALL_THICKNESS;
-  const bucketTop    = height - BUCKET_PADDING - BUCKET_HEIGHT;
-  const bucketBottom = height - BUCKET_PADDING - WALL_THICKNESS;
+  if (!ball || ball.isStatic) return;
+  const { bucketLeft, bucketRight, bucketTop, bucketBottom } = getBucketWinBounds();
 
   if (ball.position.x > bucketLeft  && ball.position.x < bucketRight &&
       ball.position.y > bucketTop   && ball.position.y < bucketBottom) {
@@ -148,6 +179,7 @@ function updateUIForState() {
   statusEl.style.display = GAME_STATE === 'CALIBRATING' ? 'block' : 'none';
   recalBtn.hidden         = GAME_STATE !== 'PLAYING';
   winEl.hidden            = GAME_STATE !== 'WIN';
+  winEl.style.display     = GAME_STATE === 'WIN' ? 'flex' : 'none';
   qrOverlay.classList.toggle('dimmed', GAME_STATE !== 'CALIBRATING');
 }
 
@@ -156,12 +188,20 @@ function startRecalibration() {
   homographyTransform = null;
   shadowBodies.forEach(b => Matter.Composite.remove(engine.world, b));
   shadowBodies = [];
-  GAME_STATE   = 'CALIBRATING';
+  if (ball) {
+    Matter.Composite.remove(engine.world, ball);
+    ball = null;
+  }
+  GAME_STATE = 'CALIBRATING';
   updateUIForState();
 }
 
 function resetToPlaying() {
   GAME_STATE = 'PLAYING';
+  if (ball) {
+    Matter.Composite.remove(engine.world, ball);
+    ball = null;
+  }
   spawnBall();
   updateUIForState();
 }
@@ -387,30 +427,22 @@ function draw() {
     pop();
   }
 
-  // Bucket glow
+  // Bucket glow (bottom-right, clear of QR corners)
+  const { bx, by } = getBucketOrigin();
   push();
   noStroke();
   fill(255, 200, 0, 40);
-  rect(BUCKET_PADDING, height - BUCKET_PADDING - BUCKET_HEIGHT,
-       BUCKET_WIDTH, BUCKET_HEIGHT);
+  rect(bx, by - BUCKET_HEIGHT, BUCKET_WIDTH, BUCKET_HEIGHT);
 
   // Bucket walls (visual only — physics bodies drawn separately)
   stroke(200, 140, 0, 200);
   strokeWeight(2);
   noFill();
-  // left wall
-  line(BUCKET_PADDING + WALL_THICKNESS,
-       height - BUCKET_PADDING - BUCKET_HEIGHT,
-       BUCKET_PADDING + WALL_THICKNESS,
-       height - BUCKET_PADDING);
-  // right wall
-  line(BUCKET_PADDING + BUCKET_WIDTH - WALL_THICKNESS,
-       height - BUCKET_PADDING - BUCKET_HEIGHT,
-       BUCKET_PADDING + BUCKET_WIDTH - WALL_THICKNESS,
-       height - BUCKET_PADDING);
-  // bottom
-  line(BUCKET_PADDING, height - BUCKET_PADDING,
-       BUCKET_PADDING + BUCKET_WIDTH, height - BUCKET_PADDING);
+  line(bx + WALL_THICKNESS, by - BUCKET_HEIGHT,
+       bx + WALL_THICKNESS, by);
+  line(bx + BUCKET_WIDTH - WALL_THICKNESS, by - BUCKET_HEIGHT,
+       bx + BUCKET_WIDTH - WALL_THICKNESS, by);
+  line(bx, by, bx + BUCKET_WIDTH, by);
   pop();
 
   // Ball
@@ -461,6 +493,7 @@ function windowResized() {
     const dstPts = buildDstPts();
     homographyTransform = PerspT(srcPts, dstPts);
   }
+  if (ball && GAME_STATE === 'PLAYING') spawnBall();
 }
 
 function keyPressed() {
