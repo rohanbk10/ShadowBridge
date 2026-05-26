@@ -21,9 +21,10 @@ let debugMode      = false;
 let cameraViewMode = false;
 
 // Pose estimation
-let poseDetector  = null;
-let poseLandmarks = null;   // Array<{x,y,z,visibility}> normalised 0-1, updated by callback
-let poseReady     = false;
+let poseDetector    = null;
+let poseLandmarks   = null;   // Array<{x,y,z,visibility}> normalised 0-1, updated by callback
+let poseReady       = false;
+let poseFramePending = false; // guard: only one frame in-flight at a time
 
 // Camera
 let video = null;
@@ -190,8 +191,10 @@ function resetToPlaying() {
 // ── SECTION 7: Pose estimation ────────────────────────────────────
 
 function initPose() {
+  // Pin to a known-good stable release so the CDN always serves the right WASM files.
+  const VERSION = '0.5.1675469404';
   poseDetector = new Pose({
-    locateFile: (f) => `https://cdn.jsdelivr.net/npm/@mediapipe/pose/${f}`
+    locateFile: (f) => `https://cdn.jsdelivr.net/npm/@mediapipe/pose@${VERSION}/${f}`
   });
   poseDetector.setOptions({
     modelComplexity: 1,
@@ -201,6 +204,7 @@ function initPose() {
     minTrackingConfidence: 0.5,
   });
   poseDetector.onResults((results) => {
+    poseFramePending = false;   // allow the next frame to be sent
     poseLandmarks = results.poseLandmarks ?? null;
     if (!poseReady) {
       poseReady  = true;
@@ -328,9 +332,15 @@ function updatePoseColliders() {
 
 // ── SECTION 10: p5 draw() ─────────────────────────────────────────
 function draw() {
-  // ── 1. Send frame to MediaPipe (fire-and-forget; result arrives via callback) ──
-  if (video && video.elt && poseDetector) {
-    poseDetector.send({ image: video.elt });
+  // ── 1. Send frame to MediaPipe (one frame in-flight at a time) ──────────────
+  // Only send when the previous result has arrived (poseFramePending = false)
+  // and the video element is actively streaming (readyState >= 2).
+  if (video && video.elt && poseDetector && !poseFramePending &&
+      video.elt.readyState >= 2) {
+    poseFramePending = true;
+    poseDetector.send({ image: video.elt }).catch(() => {
+      poseFramePending = false;   // reset on error so we don't get stuck
+    });
   }
 
   // ── 2. Physics update ─────────────────────────────────────────
