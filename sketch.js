@@ -16,8 +16,7 @@ const HEAD_RADIUS      = 36;   // canvas-px radius for head circle
 const MIN_VISIBILITY   = 0.5;  // skip MediaPipe landmarks below this confidence
 
 // ── SECTION 2: Globals ───────────────────────────────────────────
-let GAME_STATE = 'LOADING';   // 'LOADING' | 'PLAYING' | 'WIN'
-let debugMode      = false;
+let GAME_STATE     = 'LOADING';   // 'LOADING' | 'PLAYING' | 'WIN'
 let cameraViewMode = false;
 
 // Pose estimation
@@ -27,7 +26,8 @@ let poseReady       = false;
 let poseFramePending = false; // guard: only one frame in-flight at a time
 
 // Camera
-let video = null;
+let video        = null;
+let shadowBuffer = null;   // offscreen graphics buffer for unified silhouette compositing
 
 // Matter
 let engine;
@@ -41,6 +41,7 @@ let lastRespawnFrame = 0;
 // ── SECTION 3: p5 setup() ────────────────────────────────────────
 function setup() {
   createCanvas(windowWidth, windowHeight);
+  shadowBuffer = createGraphics(windowWidth, windowHeight);
 
   video = createCapture(
     { video: { width: { ideal: 640 }, height: { ideal: 480 } } },
@@ -223,33 +224,38 @@ function landmarkToCanvas(lm) {
 
 // ── SECTION 8: Shadow rendering ───────────────────────────────────
 
-// Draw one limb as a filled, rounded, rotated rectangle.
-function drawLimbSegment(ax, ay, bx, by, thickness) {
+// Draw one limb as a filled, rounded, rotated rectangle onto a p5.Graphics context.
+function drawLimbSegment(g, ax, ay, bx, by, thickness) {
   const angle = Math.atan2(by - ay, bx - ax);
   const len   = dist(ax, ay, bx, by);
   if (len < 2) return;
-  push();
-  translate((ax + bx) / 2, (ay + by) / 2);
-  rotate(angle);
-  rectMode(CENTER);
-  rect(0, 0, len, thickness, thickness / 2);
-  pop();
+  g.push();
+  g.translate((ax + bx) / 2, (ay + by) / 2);
+  g.rotate(angle);
+  g.rectMode(CENTER);
+  g.rect(0, 0, len, thickness, thickness / 2);
+  g.pop();
 }
 
 function drawShadowSilhouette() {
-  if (!poseLandmarks) return;
+  if (!poseLandmarks || !shadowBuffer) return;
 
   const lm = poseLandmarks;
+  const g  = shadowBuffer;
 
-  push();
-  noStroke();
-  fill(20, 20, 20, 200);
+  // Clear the offscreen buffer each frame, then draw every body part in solid
+  // black. Because all shapes go onto a single buffer before compositing, any
+  // overlapping parts (arm meets torso, head meets shoulder) merge seamlessly
+  // into one flat black silhouette rather than producing darker blended edges.
+  g.clear();
+  g.noStroke();
+  g.fill(0);
 
-  // Head — circle around the nose landmark
+  // Head
   const nose = lm[0];
   if (nose.visibility >= MIN_VISIBILITY) {
     const [nx, ny] = landmarkToCanvas(nose);
-    circle(nx, ny, HEAD_RADIUS * 2);
+    g.circle(nx, ny, HEAD_RADIUS * 2);
   }
 
   // Torso — filled quad: left-shoulder → right-shoulder → right-hip → left-hip
@@ -262,12 +268,12 @@ function drawShadowSilhouette() {
     const [rsx, rsy] = landmarkToCanvas(rShoulder);
     const [lhx, lhy] = landmarkToCanvas(lHip);
     const [rhx, rhy] = landmarkToCanvas(rHip);
-    beginShape();
-    vertex(lsx, lsy);
-    vertex(rsx, rsy);
-    vertex(rhx, rhy);
-    vertex(lhx, lhy);
-    endShape(CLOSE);
+    g.beginShape();
+    g.vertex(lsx, lsy);
+    g.vertex(rsx, rsy);
+    g.vertex(rhx, rhy);
+    g.vertex(lhx, lhy);
+    g.endShape(CLOSE);
   }
 
   // Arms and legs as filled rotated rectangles
@@ -284,10 +290,11 @@ function drawShadowSilhouette() {
     if (a.visibility < MIN_VISIBILITY || b.visibility < MIN_VISIBILITY) return;
     const [ax, ay] = landmarkToCanvas(a);
     const [bx, by] = landmarkToCanvas(b);
-    drawLimbSegment(ax, ay, bx, by, LIMB_THICKNESS);
+    drawLimbSegment(g, ax, ay, bx, by, LIMB_THICKNESS);
   });
 
-  pop();
+  // Composite the unified silhouette onto the main canvas
+  image(g, 0, 0);
 }
 
 // ── SECTION 9: Physics colliders from pose ────────────────────────
@@ -297,13 +304,25 @@ function updatePoseColliders() {
   shadowBodies = [];
   if (!poseLandmarks) return;
 
-  const lm = poseLandmarks;
+  const lm   = poseLandmarks;
+  const opts = { isStatic: true, label: 'shadow', friction: WALL_FRICTION, restitution: WALL_RESTITUTION };
 
-  // Physics segments mirror the rendered limbs plus torso sides
+  // Head — circle body at the nose landmark
+  const nose = lm[0];
+  if (nose.visibility >= MIN_VISIBILITY) {
+    const [nx, ny] = landmarkToCanvas(nose);
+    shadowBodies.push(Matter.Bodies.circle(nx, ny, HEAD_RADIUS, opts));
+  }
+
+  // Torso + limbs as rotated rectangle bars.
+  // [11,12] shoulder bar and [23,24] hip bar close the torso rectangle so
+  // the full torso surface (not just the sides) is a solid collider.
   const segments = [
+    [11, 12],             // shoulder bar — top of torso
     [11, 13], [13, 15],   // left upper arm, forearm
     [12, 14], [14, 16],   // right upper arm, forearm
     [11, 23], [12, 24],   // left/right torso sides
+    [23, 24],             // hip bar — bottom of torso
     [23, 25], [25, 27],   // left thigh, shin
     [24, 26], [26, 28],   // right thigh, shin
   ];
@@ -320,11 +339,9 @@ function updatePoseColliders() {
     const len   = Math.hypot(bx - ax, by - ay);
     const angle = Math.atan2(by - ay, bx - ax);
 
-    const b = Matter.Bodies.rectangle(cx, cy, Math.max(len, 10), LIMB_THICKNESS, {
-      isStatic: true, angle, label: 'shadow',
-      friction: WALL_FRICTION, restitution: WALL_RESTITUTION,
-    });
-    shadowBodies.push(b);
+    shadowBodies.push(
+      Matter.Bodies.rectangle(cx, cy, Math.max(len, 10), LIMB_THICKNESS, { ...opts, angle })
+    );
   });
 
   Matter.Composite.add(engine.world, shadowBodies);
@@ -373,21 +390,6 @@ function draw() {
     drawShadowSilhouette();
   }
 
-  // Debug: collider outlines
-  if (debugMode && shadowBodies.length > 0) {
-    push();
-    fill(255, 0, 0, 80);
-    stroke(255, 0, 0);
-    strokeWeight(1);
-    shadowBodies.forEach(b => {
-      const verts = b.vertices;
-      beginShape();
-      verts.forEach(v => vertex(v.x, v.y));
-      endShape(CLOSE);
-    });
-    pop();
-  }
-
   // Bucket glow (bottom-right)
   const { bx, by } = getBucketOrigin();
   push();
@@ -434,18 +436,18 @@ function draw() {
   textSize(12);
   textFont('monospace');
   const poseStatus = poseLandmarks ? 'tracking' : 'searching…';
-  text(`FPS: ${nf(frameRate(), 2, 1)}  pose: ${poseStatus}  [C] camera  [D] debug`, 10, height - 10);
+  text(`FPS: ${nf(frameRate(), 2, 1)}  pose: ${poseStatus}  [C] camera`, 10, height - 10);
   pop();
 }
 
 // ── SECTION 11: p5 windowResized / keyPressed ─────────────────────
 function windowResized() {
   resizeCanvas(windowWidth, windowHeight);
+  shadowBuffer = createGraphics(windowWidth, windowHeight);
   rebuildStaticBodies();
   if (ball && GAME_STATE === 'PLAYING') spawnBall();
 }
 
 function keyPressed() {
-  if (key === 'D' || key === 'd') debugMode      = !debugMode;
   if (key === 'C' || key === 'c') cameraViewMode = !cameraViewMode;
 }
