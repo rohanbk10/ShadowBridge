@@ -20,10 +20,6 @@
       background: rgba(255,255,255,0.9); padding: 6px 14px;
       border: 1px solid #ccc; border-radius: 6px; pointer-events: none;
     }
-    #btn-recapture {
-      position: absolute; top: 16px; left: 20px;
-      pointer-events: auto;
-    }
     #win-overlay {
       position: absolute; inset: 0;
       flex-direction: column;
@@ -40,8 +36,7 @@
 </head>
 <body>
   <div id="ui-overlay">
-    <div id="calibration-status"></div>
-    <button id="btn-recapture" hidden>Recapture Background</button>
+    <div id="calibration-status">Initialising pose model…</div>
     <div id="win-overlay" hidden>
       <h1>Level Won</h1>
       <button id="btn-play-again">Play Again</button>
@@ -50,6 +45,7 @@
 
   <script src="https://cdnjs.cloudflare.com/ajax/libs/matter-js/0.19.0/matter.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.9.4/p5.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/pose/pose.js" crossorigin="anonymous"></script>
   <script src="sketch.js"></script>
 </body>
 </html>

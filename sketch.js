@@ -1,44 +1,32 @@
 // ── SECTION 1: Constants ──────────────────────────────────────────
-const GRAVITY            = 1.0;
+const GRAVITY          = 1.0;
+const WALL_THICKNESS   = 20;
+const WALL_FRICTION    = 0.3;
+const WALL_RESTITUTION = 0.4;
+const BUCKET_WIDTH     = 160;
+const BUCKET_HEIGHT    = 120;
+const EDGE_MARGIN      = 30;
+const BALL_RADIUS      = 18;
+const BALL_RESTITUTION = 0.6;
+const RESPAWN_COOLDOWN = 45;
 
-// Camera capture resolution
-const CAL_WIDTH          = 640;
-const CAL_HEIGHT         = 480;
-
-// Shadow detection processes cells at a coarser logical grid.
-const PROCESS_WIDTH      = 320;
-const PROCESS_HEIGHT     = 240;
-const PROCESS_STRIDE     = CAL_WIDTH / PROCESS_WIDTH;   // = 2
-
-const SHADOW_THRESHOLD   = 50;
-const SHADOW_CELL_SIZE   = 8;
-const SHADOW_MIN_SEGMENT = 3;
-const WALL_THICKNESS     = 20;
-const WALL_FRICTION      = 0.3;
-const WALL_RESTITUTION   = 0.4;
-const BUCKET_WIDTH       = 160;
-const BUCKET_HEIGHT      = 120;
-const EDGE_MARGIN        = 30;   // inset from window edges for walls, bucket, and ball
-const BALL_RADIUS        = 18;
-const BALL_RESTITUTION   = 0.6;
-const RESPAWN_COOLDOWN   = 45;
-
-const BG_CAPTURE_FRAMES  = 180;  // 3 seconds at 60 fps
+// Pose shadow rendering
+const LIMB_THICKNESS   = 40;   // canvas-px thickness for arm/leg segments
+const HEAD_RADIUS      = 36;   // canvas-px radius for head circle
+const MIN_VISIBILITY   = 0.5;  // skip MediaPipe landmarks below this confidence
 
 // ── SECTION 2: Globals ───────────────────────────────────────────
-let GAME_STATE = 'CAPTURING_BG';   // 'CAPTURING_BG' | 'PLAYING' | 'WIN'
-let debugMode  = false;
+let GAME_STATE = 'LOADING';   // 'LOADING' | 'PLAYING' | 'WIN'
+let debugMode      = false;
 let cameraViewMode = false;
 
-// Vision
-let video            = null;
-let referencePixels  = null;
-let shadowGrid       = null;   // reused each frame for both render and physics
-let shadowGridCols   = 0;
-let shadowGridRows   = 0;
+// Pose estimation
+let poseDetector  = null;
+let poseLandmarks = null;   // Array<{x,y,z,visibility}> normalised 0-1, updated by callback
+let poseReady     = false;
 
-// Background capture countdown
-let bgCaptureCountdown = BG_CAPTURE_FRAMES;
+// Camera
+let video = null;
 
 // Matter
 let engine;
@@ -47,38 +35,28 @@ let boundaryBodies = [];
 let bucketBodies   = [];
 let shadowBodies   = [];
 
-// Adaptive shadow rebuild rate
-let shadowRebuildRate = 6;
-let lastRespawnFrame  = 0;
+let lastRespawnFrame = 0;
 
 // ── SECTION 3: p5 setup() ────────────────────────────────────────
 function setup() {
   createCanvas(windowWidth, windowHeight);
 
   video = createCapture(
-    { video: { width: { ideal: CAL_WIDTH }, height: { ideal: CAL_HEIGHT } } },
+    { video: { width: { ideal: 640 }, height: { ideal: 480 } } },
     () => {
-      video.size(CAL_WIDTH, CAL_HEIGHT);
+      video.size(640, 480);
       video.hide();
+      // Initialise pose only after the video element exists and is streaming
+      initPose();
     }
   );
-
-  // Compute grid dimensions once (they don't change)
-  shadowGridCols = Math.floor(PROCESS_WIDTH  / SHADOW_CELL_SIZE);
-  shadowGridRows = Math.floor(PROCESS_HEIGHT / SHADOW_CELL_SIZE);
-  shadowGrid     = new Uint8Array(shadowGridCols * shadowGridRows);
 
   // Matter engine — no Render, no Runner
   engine = Matter.Engine.create();
   engine.world.gravity.y = GRAVITY;
 
-  GAME_STATE         = 'CAPTURING_BG';
-  bgCaptureCountdown = BG_CAPTURE_FRAMES;
-
   rebuildStaticBodies();
 
-  document.getElementById('btn-recapture')
-    .addEventListener('click', startBgCapture);
   document.getElementById('btn-play-again')
     .addEventListener('click', resetToPlaying);
 
@@ -154,7 +132,7 @@ function rebuildStaticBodies() {
   Matter.Composite.add(engine.world, [...boundaryBodies, ...bucketBodies]);
 }
 
-// ── SECTION 5: Ball lifecycle ────────────────────────────────────
+// ── SECTION 5: Ball lifecycle ─────────────────────────────────────
 function spawnBall() {
   if (ball) Matter.Composite.remove(engine.world, ball);
   const { x, y } = getBallSpawnPoint();
@@ -192,26 +170,11 @@ function checkWin() {
 
 // ── SECTION 6: State machine helpers ─────────────────────────────
 function updateUIForState() {
-  const statusEl  = document.getElementById('calibration-status');
-  const recapBtn  = document.getElementById('btn-recapture');
-  const winEl     = document.getElementById('win-overlay');
+  const statusEl = document.getElementById('calibration-status');
+  const winEl    = document.getElementById('win-overlay');
 
-  statusEl.style.display = GAME_STATE === 'CAPTURING_BG' ? 'block' : 'none';
-  recapBtn.hidden         = GAME_STATE !== 'PLAYING';
+  statusEl.style.display = GAME_STATE === 'LOADING' ? 'block' : 'none';
   winEl.hidden            = GAME_STATE !== 'WIN';
-}
-
-function startBgCapture() {
-  referencePixels = null;
-  bgCaptureCountdown = BG_CAPTURE_FRAMES;
-  shadowBodies.forEach(b => Matter.Composite.remove(engine.world, b));
-  shadowBodies = [];
-  if (ball) {
-    Matter.Composite.remove(engine.world, ball);
-    ball = null;
-  }
-  GAME_STATE = 'CAPTURING_BG';
-  updateUIForState();
 }
 
 function resetToPlaying() {
@@ -224,102 +187,138 @@ function resetToPlaying() {
   updateUIForState();
 }
 
-// ── SECTION 7: Camera / vision helpers ───────────────────────────
+// ── SECTION 7: Pose estimation ────────────────────────────────────
 
-// Linear mapping: camera pixel coordinates → canvas coordinates.
-// Mirrors horizontally so the shadow behaves like a reflection
-// when the camera faces the same direction as the projector.
-function camToCanvas(camX, camY) {
-  return [
-    width  - (camX / CAL_WIDTH)  * width,
-    (camY / CAL_HEIGHT) * height,
+function initPose() {
+  poseDetector = new Pose({
+    locateFile: (f) => `https://cdn.jsdelivr.net/npm/@mediapipe/pose/${f}`
+  });
+  poseDetector.setOptions({
+    modelComplexity: 1,
+    smoothLandmarks: true,
+    enableSegmentation: false,
+    minDetectionConfidence: 0.5,
+    minTrackingConfidence: 0.5,
+  });
+  poseDetector.onResults((results) => {
+    poseLandmarks = results.poseLandmarks ?? null;
+    if (!poseReady) {
+      poseReady  = true;
+      GAME_STATE = 'PLAYING';
+      spawnBall();
+      updateUIForState();
+    }
+  });
+}
+
+// Map a normalised MediaPipe landmark to canvas coordinates.
+// Mirrors x so the player's right side appears on the right of the projection.
+function landmarkToCanvas(lm) {
+  return [(1 - lm.x) * width, lm.y * height];
+}
+
+// ── SECTION 8: Shadow rendering ───────────────────────────────────
+
+// Draw one limb as a filled, rounded, rotated rectangle.
+function drawLimbSegment(ax, ay, bx, by, thickness) {
+  const angle = Math.atan2(by - ay, bx - ax);
+  const len   = dist(ax, ay, bx, by);
+  if (len < 2) return;
+  push();
+  translate((ax + bx) / 2, (ay + by) / 2);
+  rotate(angle);
+  rectMode(CENTER);
+  rect(0, 0, len, thickness, thickness / 2);
+  pop();
+}
+
+function drawShadowSilhouette() {
+  if (!poseLandmarks) return;
+
+  const lm = poseLandmarks;
+
+  push();
+  noStroke();
+  fill(20, 20, 20, 200);
+
+  // Head — circle around the nose landmark
+  const nose = lm[0];
+  if (nose.visibility >= MIN_VISIBILITY) {
+    const [nx, ny] = landmarkToCanvas(nose);
+    circle(nx, ny, HEAD_RADIUS * 2);
+  }
+
+  // Torso — filled quad: left-shoulder → right-shoulder → right-hip → left-hip
+  const lShoulder = lm[11];
+  const rShoulder = lm[12];
+  const lHip      = lm[23];
+  const rHip      = lm[24];
+  if ([lShoulder, rShoulder, lHip, rHip].every(p => p.visibility >= MIN_VISIBILITY)) {
+    const [lsx, lsy] = landmarkToCanvas(lShoulder);
+    const [rsx, rsy] = landmarkToCanvas(rShoulder);
+    const [lhx, lhy] = landmarkToCanvas(lHip);
+    const [rhx, rhy] = landmarkToCanvas(rHip);
+    beginShape();
+    vertex(lsx, lsy);
+    vertex(rsx, rsy);
+    vertex(rhx, rhy);
+    vertex(lhx, lhy);
+    endShape(CLOSE);
+  }
+
+  // Arms and legs as filled rotated rectangles
+  const limbPairs = [
+    [11, 13], [13, 15],   // left upper arm, forearm
+    [12, 14], [14, 16],   // right upper arm, forearm
+    [23, 25], [25, 27],   // left thigh, shin
+    [24, 26], [26, 28],   // right thigh, shin
   ];
+
+  limbPairs.forEach(([iA, iB]) => {
+    const a = lm[iA];
+    const b = lm[iB];
+    if (a.visibility < MIN_VISIBILITY || b.visibility < MIN_VISIBILITY) return;
+    const [ax, ay] = landmarkToCanvas(a);
+    const [bx, by] = landmarkToCanvas(b);
+    drawLimbSegment(ax, ay, bx, by, LIMB_THICKNESS);
+  });
+
+  pop();
 }
 
-function buildShadowGrid() {
-  video.loadPixels();
-  if (!video.pixels || video.pixels.length === 0) return false;
+// ── SECTION 9: Physics colliders from pose ────────────────────────
 
-  const px  = video.pixels;
-  const ref = referencePixels;
-
-  for (let row = 0; row < shadowGridRows; row++) {
-    for (let col = 0; col < shadowGridCols; col++) {
-      let darkCount = 0;
-      const totalPixels = SHADOW_CELL_SIZE * SHADOW_CELL_SIZE;
-      for (let dy = 0; dy < SHADOW_CELL_SIZE; dy++) {
-        for (let dx = 0; dx < SHADOW_CELL_SIZE; dx++) {
-          const cx = (col * SHADOW_CELL_SIZE + dx) * PROCESS_STRIDE;
-          const cy = (row * SHADOW_CELL_SIZE + dy) * PROCESS_STRIDE;
-          const i  = (cy * CAL_WIDTH + cx) * 4;
-          const brightness    = (px[i] + px[i + 1] + px[i + 2]) / 3;
-          const refBrightness = ref
-            ? (ref[i] + ref[i + 1] + ref[i + 2]) / 3
-            : 255;
-          if (brightness < refBrightness - SHADOW_THRESHOLD) darkCount++;
-        }
-      }
-      shadowGrid[row * shadowGridCols + col] = darkCount > totalPixels * 0.5 ? 1 : 0;
-    }
-  }
-  return true;
-}
-
-function updateShadowColliders() {
-  if (!buildShadowGrid()) return;
-
-  // RLE: collect candidate segments per row
-  const candidates = [];
-  for (let row = 0; row < shadowGridRows; row++) {
-    let runStart = -1;
-    for (let col = 0; col <= shadowGridCols; col++) {
-      const isShadow = col < shadowGridCols && shadowGrid[row * shadowGridCols + col] === 1;
-      if (isShadow && runStart === -1) {
-        runStart = col;
-      } else if (!isShadow && runStart !== -1) {
-        const runLen = col - runStart;
-        if (runLen >= SHADOW_MIN_SEGMENT) {
-          candidates.push({ row, runStart, runLen });
-        }
-        runStart = -1;
-      }
-    }
-  }
-
-  // Sort by length descending, cap at 200
-  candidates.sort((a, b) => b.runLen - a.runLen);
-  const toAdd = candidates.slice(0, 200);
-
+function updatePoseColliders() {
   shadowBodies.forEach(b => Matter.Composite.remove(engine.world, b));
   shadowBodies = [];
+  if (!poseLandmarks) return;
 
-  toAdd.forEach(({ row, runStart, runLen }) => {
-    const camCX = (runStart + runLen / 2) * SHADOW_CELL_SIZE * PROCESS_STRIDE;
-    const camCY = (row + 0.5)             * SHADOW_CELL_SIZE * PROCESS_STRIDE;
-    const [cx, cy] = camToCanvas(camCX, camCY);
+  const lm = poseLandmarks;
 
-    if (cx < WALL_THICKNESS || cx > width - WALL_THICKNESS) return;
-    if (cy < EDGE_MARGIN    || cy > height) return;
+  // Physics segments mirror the rendered limbs plus torso sides
+  const segments = [
+    [11, 13], [13, 15],   // left upper arm, forearm
+    [12, 14], [14, 16],   // right upper arm, forearm
+    [11, 23], [12, 24],   // left/right torso sides
+    [23, 25], [25, 27],   // left thigh, shin
+    [24, 26], [26, 28],   // right thigh, shin
+  ];
 
-    // Width: transform both horizontal edges through the linear mapping
-    const camLeft  = runStart            * SHADOW_CELL_SIZE * PROCESS_STRIDE;
-    const camRight = (runStart + runLen) * SHADOW_CELL_SIZE * PROCESS_STRIDE;
-    const [lx]     = camToCanvas(camLeft,  camCY);
-    const [rx]     = camToCanvas(camRight, camCY);
-    const bodyW    = Math.abs(rx - lx);
+  segments.forEach(([iA, iB]) => {
+    const lmA = lm[iA];
+    const lmB = lm[iB];
+    if (lmA.visibility < MIN_VISIBILITY || lmB.visibility < MIN_VISIBILITY) return;
 
-    // Height: transform top and bottom of the cell row
-    const camTop    = row       * SHADOW_CELL_SIZE * PROCESS_STRIDE;
-    const camBottom = (row + 1) * SHADOW_CELL_SIZE * PROCESS_STRIDE;
-    const [, ty]    = camToCanvas(camCX, camTop);
-    const [, by2]   = camToCanvas(camCX, camBottom);
-    const bodyH     = Math.abs(by2 - ty);
+    const [ax, ay] = landmarkToCanvas(lmA);
+    const [bx, by] = landmarkToCanvas(lmB);
+    const cx    = (ax + bx) / 2;
+    const cy    = (ay + by) / 2;
+    const len   = Math.hypot(bx - ax, by - ay);
+    const angle = Math.atan2(by - ay, bx - ax);
 
-    const b = Matter.Bodies.rectangle(cx, cy, Math.max(bodyW, 2), Math.max(bodyH, 2), {
-      isStatic:    true,
-      label:       'shadow',
-      friction:    WALL_FRICTION,
-      restitution: WALL_RESTITUTION,
+    const b = Matter.Bodies.rectangle(cx, cy, Math.max(len, 10), LIMB_THICKNESS, {
+      isStatic: true, angle, label: 'shadow',
+      friction: WALL_FRICTION, restitution: WALL_RESTITUTION,
     });
     shadowBodies.push(b);
   });
@@ -327,37 +326,21 @@ function updateShadowColliders() {
   Matter.Composite.add(engine.world, shadowBodies);
 }
 
-// ── SECTION 8: p5 draw() ─────────────────────────────────────────
+// ── SECTION 10: p5 draw() ─────────────────────────────────────────
 function draw() {
-  // ── 1. Physics update ──────────────────────────────────────────
+  // ── 1. Send frame to MediaPipe (fire-and-forget; result arrives via callback) ──
+  if (video && video.elt && poseDetector) {
+    poseDetector.send({ image: video.elt });
+  }
+
+  // ── 2. Physics update ─────────────────────────────────────────
   if (GAME_STATE !== 'WIN') {
     Matter.Engine.update(engine, 1000 / 60);
   }
 
-  // ── 2. Background capture countdown ───────────────────────────
-  if (GAME_STATE === 'CAPTURING_BG') {
-    bgCaptureCountdown--;
-
-    const secsLeft = Math.ceil(bgCaptureCountdown / 60);
-    document.getElementById('calibration-status').textContent =
-      bgCaptureCountdown > 0
-        ? `Step away from the camera — capturing in ${secsLeft}…`
-        : 'Capturing background…';
-
-    if (bgCaptureCountdown <= 0) {
-      video.loadPixels();
-      if (video.pixels && video.pixels.length > 0) {
-        referencePixels = new Uint8Array(video.pixels);
-        GAME_STATE = 'PLAYING';
-        spawnBall();
-        updateUIForState();
-      }
-    }
-  }
-
   // ── 3. Game logic (PLAYING only) ──────────────────────────────
   if (GAME_STATE === 'PLAYING') {
-    if (frameCount % shadowRebuildRate === 0) updateShadowColliders();
+    updatePoseColliders();
     checkWin();
     checkRespawn();
   }
@@ -365,48 +348,32 @@ function draw() {
   // ── 4. Render ─────────────────────────────────────────────────
   background(255);
 
-  // Optional webcam overlay (toggle with C)
+  // Optional webcam overlay (toggle with C) — mirrored to match shadow
   if (cameraViewMode && video) {
     push();
     tint(255, 80);
-    // Draw mirrored to match camToCanvas horizontal flip
     translate(width, 0);
     scale(-1, 1);
     image(video, 0, 0, width, height);
     pop();
   }
 
-  // Shadow silhouette rendering — drawn first so game elements sit on top
+  // Person shadow silhouette — drawn before game elements so ball sits on top
   if (GAME_STATE === 'PLAYING' || GAME_STATE === 'WIN') {
-    push();
-    noStroke();
-    const cellW = width  / shadowGridCols;
-    const cellH = height / shadowGridRows;
-    for (let row = 0; row < shadowGridRows; row++) {
-      for (let col = 0; col < shadowGridCols; col++) {
-        if (shadowGrid[row * shadowGridCols + col] === 1) {
-          // Mirror horizontally to match camToCanvas
-          const drawCol = shadowGridCols - 1 - col;
-          fill(20, 20, 20, 160);
-          rect(drawCol * cellW, row * cellH, cellW + 1, cellH + 1);
-        }
-      }
-    }
-    pop();
+    drawShadowSilhouette();
   }
 
-  // Debug: shadow collider rects
+  // Debug: collider outlines
   if (debugMode && shadowBodies.length > 0) {
     push();
     fill(255, 0, 0, 80);
     stroke(255, 0, 0);
     strokeWeight(1);
     shadowBodies.forEach(b => {
-      const { x, y } = b.position;
-      const w = b.bounds.max.x - b.bounds.min.x;
-      const h = b.bounds.max.y - b.bounds.min.y;
-      rectMode(CENTER);
-      rect(x, y, w, h);
+      const verts = b.vertices;
+      beginShape();
+      verts.forEach(v => vertex(v.x, v.y));
+      endShape(CLOSE);
     });
     pop();
   }
@@ -442,7 +409,7 @@ function draw() {
 
     drawingContext.shadowBlur = 0;
     fill(0, 120, 220);
-    const vel = ball.velocity;
+    const vel   = ball.velocity;
     const speed = sqrt(vel.x * vel.x + vel.y * vel.y);
     if (speed > 0.5) {
       circle(ballX + vel.x * 2, ballY + vel.y * 2, 5);
@@ -456,15 +423,12 @@ function draw() {
   noStroke();
   textSize(12);
   textFont('monospace');
-  text(`FPS: ${nf(frameRate(), 2, 1)}  shadowRate: ${shadowRebuildRate}  [C] camera  [D] debug`, 10, height - 10);
+  const poseStatus = poseLandmarks ? 'tracking' : 'searching…';
+  text(`FPS: ${nf(frameRate(), 2, 1)}  pose: ${poseStatus}  [C] camera  [D] debug`, 10, height - 10);
   pop();
-
-  // ── 5. Adaptive shadow rebuild rate ───────────────────────────
-  if (frameRate() < 30) shadowRebuildRate = min(shadowRebuildRate + 1, 15);
-  if (frameRate() > 55) shadowRebuildRate = max(shadowRebuildRate - 1, 3);
 }
 
-// ── SECTION 9: p5 windowResized / keyPressed ─────────────────────
+// ── SECTION 11: p5 windowResized / keyPressed ─────────────────────
 function windowResized() {
   resizeCanvas(windowWidth, windowHeight);
   rebuildStaticBodies();
@@ -472,6 +436,6 @@ function windowResized() {
 }
 
 function keyPressed() {
-  if (key === 'D' || key === 'd') debugMode = !debugMode;
+  if (key === 'D' || key === 'd') debugMode      = !debugMode;
   if (key === 'C' || key === 'c') cameraViewMode = !cameraViewMode;
 }
