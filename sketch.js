@@ -1,14 +1,11 @@
 // ── SECTION 1: Constants ──────────────────────────────────────────
 const GRAVITY            = 1.0;
 
-// Camera capture resolution — higher res makes QR codes larger in the frame
-// so jsQR can decode them reliably even when the camera is far from the wall.
+// Camera capture resolution
 const CAL_WIDTH          = 640;
 const CAL_HEIGHT         = 480;
 
 // Shadow detection processes cells at a coarser logical grid.
-// PROCESS_STRIDE is how many CAL pixels equal one logical shadow pixel.
-// Keeping this as a power-of-two integer makes the stride arithmetic exact.
 const PROCESS_WIDTH      = 320;
 const PROCESS_HEIGHT     = 240;
 const PROCESS_STRIDE     = CAL_WIDTH / PROCESS_WIDTH;   // = 2
@@ -21,24 +18,27 @@ const WALL_FRICTION      = 0.3;
 const WALL_RESTITUTION   = 0.4;
 const BUCKET_WIDTH       = 160;
 const BUCKET_HEIGHT      = 120;
-const QR_SIZE            = 80;
-const QR_PADDING         = 20;
-const QR_SAFE_MARGIN     = QR_PADDING + QR_SIZE + 16;
+const EDGE_MARGIN        = 30;   // inset from window edges for walls, bucket, and ball
 const BALL_RADIUS        = 18;
 const BALL_RESTITUTION   = 0.6;
 const RESPAWN_COOLDOWN   = 45;
 
+const BG_CAPTURE_FRAMES  = 180;  // 3 seconds at 60 fps
+
 // ── SECTION 2: Globals ───────────────────────────────────────────
-let GAME_STATE = 'CALIBRATING';   // 'CALIBRATING' | 'PLAYING' | 'WIN'
+let GAME_STATE = 'CAPTURING_BG';   // 'CAPTURING_BG' | 'PLAYING' | 'WIN'
 let debugMode  = false;
 let cameraViewMode = false;
 
 // Vision
-let homographyTransform = null;
-let detectedMarkers     = {};     // { 'SHADOW_TL': {camX,camY}, ... }
-let video               = null;
-let referencePixels     = null;   // Uint8Array snapshot of the projected wall with no shadow present;
-                                  // captured at the CALIBRATING→PLAYING transition for background subtraction
+let video            = null;
+let referencePixels  = null;
+let shadowGrid       = null;   // reused each frame for both render and physics
+let shadowGridCols   = 0;
+let shadowGridRows   = 0;
+
+// Background capture countdown
+let bgCaptureCountdown = BG_CAPTURE_FRAMES;
 
 // Matter
 let engine;
@@ -55,9 +55,6 @@ let lastRespawnFrame  = 0;
 function setup() {
   createCanvas(windowWidth, windowHeight);
 
-  // Request calibration resolution explicitly so jsQR sees large, crisp QR
-  // codes. Shadow detection samples this same frame at a 2× stride, so no
-  // separate low-res stream or mid-game resize is needed.
   video = createCapture(
     { video: { width: { ideal: CAL_WIDTH }, height: { ideal: CAL_HEIGHT } } },
     () => {
@@ -66,19 +63,22 @@ function setup() {
     }
   );
 
+  // Compute grid dimensions once (they don't change)
+  shadowGridCols = Math.floor(PROCESS_WIDTH  / SHADOW_CELL_SIZE);
+  shadowGridRows = Math.floor(PROCESS_HEIGHT / SHADOW_CELL_SIZE);
+  shadowGrid     = new Uint8Array(shadowGridCols * shadowGridRows);
+
   // Matter engine — no Render, no Runner
   engine = Matter.Engine.create();
   engine.world.gravity.y = GRAVITY;
 
-  GAME_STATE = 'CALIBRATING';
-  detectedMarkers = {};
-  homographyTransform = null;
+  GAME_STATE         = 'CAPTURING_BG';
+  bgCaptureCountdown = BG_CAPTURE_FRAMES;
 
   rebuildStaticBodies();
 
-  // DOM wiring
-  document.getElementById('btn-recalibrate')
-    .addEventListener('click', startRecalibration);
+  document.getElementById('btn-recapture')
+    .addEventListener('click', startBgCapture);
   document.getElementById('btn-play-again')
     .addEventListener('click', resetToPlaying);
 
@@ -89,8 +89,8 @@ function setup() {
 // ── SECTION 4: Layout + Matter bodies ────────────────────────────
 function getBucketOrigin() {
   return {
-    bx: width - QR_SAFE_MARGIN - BUCKET_WIDTH,
-    by: height - QR_SAFE_MARGIN,
+    bx: width  - EDGE_MARGIN - BUCKET_WIDTH,
+    by: height - EDGE_MARGIN,
   };
 }
 
@@ -106,8 +106,8 @@ function getBucketWinBounds() {
 
 function getBallSpawnPoint() {
   return {
-    x: QR_SAFE_MARGIN + BALL_RADIUS + 12,
-    y: QR_SAFE_MARGIN + 36,
+    x: EDGE_MARGIN + BALL_RADIUS + 12,
+    y: EDGE_MARGIN + 36,
   };
 }
 
@@ -119,22 +119,21 @@ function rebuildStaticBodies() {
 
   const opts = { isStatic: true, friction: WALL_FRICTION, restitution: WALL_RESTITUTION };
 
-  // Side walls + ceiling inset so they do not run through corner QR zones
-  const wallTop    = QR_SAFE_MARGIN;
-  const wallHeight = max(height - QR_SAFE_MARGIN * 2, 100);
+  const wallTop     = EDGE_MARGIN;
+  const wallHeight  = max(height - EDGE_MARGIN * 2, 100);
   const wallCenterY = wallTop + wallHeight / 2;
 
   const leftWall  = Matter.Bodies.rectangle(
     WALL_THICKNESS / 2, wallCenterY, WALL_THICKNESS, wallHeight, opts);
   const rightWall = Matter.Bodies.rectangle(
     width - WALL_THICKNESS / 2, wallCenterY, WALL_THICKNESS, wallHeight, opts);
-  const ceilingWidth = max(width - QR_SAFE_MARGIN * 2, 100);
+  const ceilingWidth = max(width - EDGE_MARGIN * 2, 100);
   const ceiling = Matter.Bodies.rectangle(
-    width / 2, QR_SAFE_MARGIN - WALL_THICKNESS / 2,
+    width / 2, EDGE_MARGIN - WALL_THICKNESS / 2,
     ceilingWidth, WALL_THICKNESS, opts);
   boundaryBodies.push(leftWall, rightWall, ceiling);
 
-  // Bucket — bottom-right, clear of BR QR corner
+  // Bucket — bottom-right
   const { bx, by } = getBucketOrigin();
 
   const bucketBottom = Matter.Bodies.rectangle(
@@ -194,27 +193,24 @@ function checkWin() {
 // ── SECTION 6: State machine helpers ─────────────────────────────
 function updateUIForState() {
   const statusEl  = document.getElementById('calibration-status');
-  const recalBtn  = document.getElementById('btn-recalibrate');
+  const recapBtn  = document.getElementById('btn-recapture');
   const winEl     = document.getElementById('win-overlay');
-  const qrOverlay = document.getElementById('qr-overlay');
 
-  statusEl.style.display = GAME_STATE === 'CALIBRATING' ? 'block' : 'none';
-  recalBtn.hidden         = GAME_STATE !== 'PLAYING';
+  statusEl.style.display = GAME_STATE === 'CAPTURING_BG' ? 'block' : 'none';
+  recapBtn.hidden         = GAME_STATE !== 'PLAYING';
   winEl.hidden            = GAME_STATE !== 'WIN';
-  qrOverlay.classList.toggle('dimmed', GAME_STATE !== 'CALIBRATING');
 }
 
-function startRecalibration() {
-  detectedMarkers     = {};
-  homographyTransform = null;
-  referencePixels     = null;   // stale snapshot — will be re-captured at next transition
+function startBgCapture() {
+  referencePixels = null;
+  bgCaptureCountdown = BG_CAPTURE_FRAMES;
   shadowBodies.forEach(b => Matter.Composite.remove(engine.world, b));
   shadowBodies = [];
   if (ball) {
     Matter.Composite.remove(engine.world, ball);
     ball = null;
   }
-  GAME_STATE = 'CALIBRATING';
+  GAME_STATE = 'CAPTURING_BG';
   updateUIForState();
 }
 
@@ -230,104 +226,54 @@ function resetToPlaying() {
 
 // ── SECTION 7: Camera / vision helpers ───────────────────────────
 
-function buildDstPts() {
-  const half = QR_SIZE / 2;
-  const p    = QR_PADDING;
-  const W    = windowWidth;
-  const H    = windowHeight;
-  return [
-    p + half,     p + half,       // TL
-    W - p - half, p + half,       // TR
-    W - p - half, H - p - half,   // BR
-    p + half,     H - p - half,   // BL
-  ];
-}
-
-function buildSrcPts(m) {
-  return [
-    m['SHADOW_TL'].camX, m['SHADOW_TL'].camY,
-    m['SHADOW_TR'].camX, m['SHADOW_TR'].camY,
-    m['SHADOW_BR'].camX, m['SHADOW_BR'].camY,
-    m['SHADOW_BL'].camX, m['SHADOW_BL'].camY,
-  ];
-}
-
+// Linear mapping: camera pixel coordinates → canvas coordinates.
+// Mirrors horizontally so the shadow behaves like a reflection
+// when the camera faces the same direction as the projector.
 function camToCanvas(camX, camY) {
-  if (!homographyTransform) return [camX, camY];
-  return homographyTransform.transform(camX, camY); // returns [x, y]
+  return [
+    width  - (camX / CAL_WIDTH)  * width,
+    (camY / CAL_HEIGHT) * height,
+  ];
 }
 
-function scanQuadrant(px, rx, ry, rw, rh) {
-  const data = new Uint8ClampedArray(rw * rh * 4);
-  for (let row = 0; row < rh; row++) {
-    for (let col = 0; col < rw; col++) {
-      // Stride must match the full CAL frame width, not the shadow-processing width.
-      const si = ((ry + row) * CAL_WIDTH + (rx + col)) * 4;
-      const di = (row * rw + col) * 4;
-      data[di]     = px[si];
-      data[di + 1] = px[si + 1];
-      data[di + 2] = px[si + 2];
-      data[di + 3] = px[si + 3];
-    }
-  }
-  const result = jsQR(data, rw, rh);
-  if (!result) return null;
-
-  // Map sub-region corner back to full-frame coordinates
-  const loc = result.location;
-  const camX = rx + (loc.topLeftCorner.x + loc.topRightCorner.x +
-                     loc.bottomRightCorner.x + loc.bottomLeftCorner.x) / 4;
-  const camY = ry + (loc.topLeftCorner.y + loc.topRightCorner.y +
-                     loc.bottomRightCorner.y + loc.bottomLeftCorner.y) / 4;
-  return { text: result.data, camX, camY };
-}
-
-function updateShadowColliders() {
-  if (!homographyTransform) return;
-
+function buildShadowGrid() {
   video.loadPixels();
-  if (!video.pixels || video.pixels.length === 0) return;
+  if (!video.pixels || video.pixels.length === 0) return false;
 
-  const px   = video.pixels;
-  const ref  = referencePixels; // may be null before first calibration
-  const cols = Math.floor(PROCESS_WIDTH  / SHADOW_CELL_SIZE);
-  const rows = Math.floor(PROCESS_HEIGHT / SHADOW_CELL_SIZE);
+  const px  = video.pixels;
+  const ref = referencePixels;
 
-  // Build shadow grid: true = cell is meaningfully darker than the reference frame.
-  // Background subtraction lets us ignore projected game graphics (ball, bucket lines)
-  // that would otherwise look like shadow under a pure brightness threshold.
-  //
-  // Pixels are sampled from the full 640×480 CAL frame using PROCESS_STRIDE,
-  // giving the same logical cell density as a 320×240 frame but from a
-  // higher-quality capture — no second video stream or mid-game resize needed.
-  const grid = new Uint8Array(cols * rows);
-  for (let row = 0; row < rows; row++) {
-    for (let col = 0; col < cols; col++) {
+  for (let row = 0; row < shadowGridRows; row++) {
+    for (let col = 0; col < shadowGridCols; col++) {
       let darkCount = 0;
       const totalPixels = SHADOW_CELL_SIZE * SHADOW_CELL_SIZE;
       for (let dy = 0; dy < SHADOW_CELL_SIZE; dy++) {
         for (let dx = 0; dx < SHADOW_CELL_SIZE; dx++) {
-          // Multiply by PROCESS_STRIDE to convert logical coords → CAL pixels
           const cx = (col * SHADOW_CELL_SIZE + dx) * PROCESS_STRIDE;
           const cy = (row * SHADOW_CELL_SIZE + dy) * PROCESS_STRIDE;
           const i  = (cy * CAL_WIDTH + cx) * 4;
           const brightness    = (px[i] + px[i + 1] + px[i + 2]) / 3;
           const refBrightness = ref
             ? (ref[i] + ref[i + 1] + ref[i + 2]) / 3
-            : 255; // treat full white as reference when no snapshot exists
+            : 255;
           if (brightness < refBrightness - SHADOW_THRESHOLD) darkCount++;
         }
       }
-      if (darkCount > totalPixels * 0.5) grid[row * cols + col] = 1;
+      shadowGrid[row * shadowGridCols + col] = darkCount > totalPixels * 0.5 ? 1 : 0;
     }
   }
+  return true;
+}
+
+function updateShadowColliders() {
+  if (!buildShadowGrid()) return;
 
   // RLE: collect candidate segments per row
   const candidates = [];
-  for (let row = 0; row < rows; row++) {
+  for (let row = 0; row < shadowGridRows; row++) {
     let runStart = -1;
-    for (let col = 0; col <= cols; col++) {
-      const isShadow = col < cols && grid[row * cols + col] === 1;
+    for (let col = 0; col <= shadowGridCols; col++) {
+      const isShadow = col < shadowGridCols && shadowGrid[row * shadowGridCols + col] === 1;
       if (isShadow && runStart === -1) {
         runStart = col;
       } else if (!isShadow && runStart !== -1) {
@@ -344,33 +290,25 @@ function updateShadowColliders() {
   candidates.sort((a, b) => b.runLen - a.runLen);
   const toAdd = candidates.slice(0, 200);
 
-  // Remove old shadow bodies
   shadowBodies.forEach(b => Matter.Composite.remove(engine.world, b));
   shadowBodies = [];
 
   toAdd.forEach(({ row, runStart, runLen }) => {
-    // All cam-space coordinates are in CAL pixels (multiply logical cell coords
-    // by PROCESS_STRIDE) so they align with the homography, which was built
-    // from QR-code positions detected in the 640×480 frame.
     const camCX = (runStart + runLen / 2) * SHADOW_CELL_SIZE * PROCESS_STRIDE;
     const camCY = (row + 0.5)             * SHADOW_CELL_SIZE * PROCESS_STRIDE;
     const [cx, cy] = camToCanvas(camCX, camCY);
 
-    // Discard segments that project outside the walled play area. Without this,
-    // shadow bodies can appear behind the side walls or above the ceiling wall,
-    // creating invisible obstacles outside the playfield.
     if (cx < WALL_THICKNESS || cx > width - WALL_THICKNESS) return;
-    if (cy < QR_SAFE_MARGIN || cy > height) return;
+    if (cy < EDGE_MARGIN    || cy > height) return;
 
-    // Derive actual canvas-space width by transforming both horizontal edges
-    // of the segment through the homography rather than using a linear scale.
-    const camLeft  = runStart             * SHADOW_CELL_SIZE * PROCESS_STRIDE;
-    const camRight = (runStart + runLen)  * SHADOW_CELL_SIZE * PROCESS_STRIDE;
+    // Width: transform both horizontal edges through the linear mapping
+    const camLeft  = runStart            * SHADOW_CELL_SIZE * PROCESS_STRIDE;
+    const camRight = (runStart + runLen) * SHADOW_CELL_SIZE * PROCESS_STRIDE;
     const [lx]     = camToCanvas(camLeft,  camCY);
     const [rx]     = camToCanvas(camRight, camCY);
     const bodyW    = Math.abs(rx - lx);
 
-    // Derive height by transforming the top and bottom edges of the cell row.
+    // Height: transform top and bottom of the cell row
     const camTop    = row       * SHADOW_CELL_SIZE * PROCESS_STRIDE;
     const camBottom = (row + 1) * SHADOW_CELL_SIZE * PROCESS_STRIDE;
     const [, ty]    = camToCanvas(camCX, camTop);
@@ -396,39 +334,20 @@ function draw() {
     Matter.Engine.update(engine, 1000 / 60);
   }
 
-  // ── 2. QR scan (CALIBRATING only) ─────────────────────────────
-  if (GAME_STATE === 'CALIBRATING') {
-    video.loadPixels();
-    if (video.pixels && video.pixels.length > 0) {
-      // Overlap margin scaled to CAL resolution so each half-frame has the
-      // same proportional overlap as before (≈12.5 % of each half-width).
-      const OV = 20 * PROCESS_STRIDE;
-      const HW = CAL_WIDTH  / 2 + OV;
-      const HH = CAL_HEIGHT / 2 + OV;
+  // ── 2. Background capture countdown ───────────────────────────
+  if (GAME_STATE === 'CAPTURING_BG') {
+    bgCaptureCountdown--;
 
-      const quadrants = [
-        { rx: 0,                ry: 0,               rw: HW, rh: HH },  // TL
-        { rx: CAL_WIDTH/2-OV,  ry: 0,               rw: HW, rh: HH },  // TR
-        { rx: 0,               ry: CAL_HEIGHT/2-OV, rw: HW, rh: HH },  // BL
-        { rx: CAL_WIDTH/2-OV,  ry: CAL_HEIGHT/2-OV, rw: HW, rh: HH }, // BR
-      ];
+    const secsLeft = Math.ceil(bgCaptureCountdown / 60);
+    document.getElementById('calibration-status').textContent =
+      bgCaptureCountdown > 0
+        ? `Step away from the camera — capturing in ${secsLeft}…`
+        : 'Capturing background…';
 
-      quadrants.forEach(q => {
-        const hit = scanQuadrant(video.pixels, q.rx, q.ry, q.rw, q.rh);
-        if (hit && ['SHADOW_TL','SHADOW_TR','SHADOW_BL','SHADOW_BR'].includes(hit.text)) {
-          detectedMarkers[hit.text] = { camX: hit.camX, camY: hit.camY };
-        }
-      });
-
-      // Transition when all four found
-      if (Object.keys(detectedMarkers).length === 4) {
-        // Snapshot the current camera frame as the background reference.
-        // At this moment no user shadow is present (user was holding the camera
-        // to frame the QR codes), so this cleanly represents the projected wall
-        // without any occlusion.
+    if (bgCaptureCountdown <= 0) {
+      video.loadPixels();
+      if (video.pixels && video.pixels.length > 0) {
         referencePixels = new Uint8Array(video.pixels);
-
-        homographyTransform = PerspT(buildSrcPts(detectedMarkers), buildDstPts());
         GAME_STATE = 'PLAYING';
         spawnBall();
         updateUIForState();
@@ -446,28 +365,33 @@ function draw() {
   // ── 4. Render ─────────────────────────────────────────────────
   background(255);
 
-  // Optional webcam overlay (toggle with C — unmirrored mobile camera feed)
+  // Optional webcam overlay (toggle with C)
   if (cameraViewMode && video) {
     push();
     tint(255, 80);
+    // Draw mirrored to match camToCanvas horizontal flip
+    translate(width, 0);
+    scale(-1, 1);
     image(video, 0, 0, width, height);
     pop();
   }
 
-  // Calibration feedback (CALIBRATING only)
-  if (GAME_STATE === 'CALIBRATING') {
-    const found = ['SHADOW_TL','SHADOW_TR','SHADOW_BL','SHADOW_BR']
-      .map(k => `${k.replace('SHADOW_','')} ${detectedMarkers[k] ? '✓' : '✗'}`)
-      .join('  ');
-    document.getElementById('calibration-status').textContent = `Found: ${found}`;
-
+  // Shadow silhouette rendering — drawn first so game elements sit on top
+  if (GAME_STATE === 'PLAYING' || GAME_STATE === 'WIN') {
     push();
     noStroke();
-    fill(0, 160, 60, 220);
-    Object.values(detectedMarkers).forEach(({ camX, camY }) => {
-      const [sx, sy] = camToCanvas(camX, camY);
-      circle(sx, sy, 16);
-    });
+    const cellW = width  / shadowGridCols;
+    const cellH = height / shadowGridRows;
+    for (let row = 0; row < shadowGridRows; row++) {
+      for (let col = 0; col < shadowGridCols; col++) {
+        if (shadowGrid[row * shadowGridCols + col] === 1) {
+          // Mirror horizontally to match camToCanvas
+          const drawCol = shadowGridCols - 1 - col;
+          fill(20, 20, 20, 160);
+          rect(drawCol * cellW, row * cellH, cellW + 1, cellH + 1);
+        }
+      }
+    }
     pop();
   }
 
@@ -487,14 +411,13 @@ function draw() {
     pop();
   }
 
-  // Bucket glow (bottom-right, clear of QR corners)
+  // Bucket glow (bottom-right)
   const { bx, by } = getBucketOrigin();
   push();
   noStroke();
   fill(255, 200, 0, 40);
   rect(bx, by - BUCKET_HEIGHT, BUCKET_WIDTH, BUCKET_HEIGHT);
 
-  // Bucket walls (visual only — physics bodies drawn separately)
   stroke(200, 140, 0, 200);
   strokeWeight(2);
   noFill();
@@ -511,14 +434,12 @@ function draw() {
     const ballX = ball.position.x;
     const ballY = ball.position.y;
 
-    // Glow
     drawingContext.shadowColor = 'rgba(0,0,0,0.25)';
     drawingContext.shadowBlur  = 16;
     fill(30, 30, 40);
     noStroke();
     circle(ballX, ballY, BALL_RADIUS * 2);
 
-    // Velocity direction dot
     drawingContext.shadowBlur = 0;
     fill(0, 120, 220);
     const vel = ball.velocity;
@@ -547,12 +468,6 @@ function draw() {
 function windowResized() {
   resizeCanvas(windowWidth, windowHeight);
   rebuildStaticBodies();
-  // If already calibrated, recompute homography for new window size
-  if (homographyTransform && Object.keys(detectedMarkers).length === 4) {
-    const srcPts = buildSrcPts(detectedMarkers);
-    const dstPts = buildDstPts();
-    homographyTransform = PerspT(srcPts, dstPts);
-  }
   if (ball && GAME_STATE === 'PLAYING') spawnBall();
 }
 
